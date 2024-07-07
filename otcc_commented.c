@@ -10,9 +10,9 @@ int input_fp;
 
 /* symbol table key buffer: all textual symbols and keywords are appended to this
    buffer. A single space is used as a delimiter for symbols. This buffer is linearly
-   searched for matching symbols. Keywords are inserted first amd thus it's easy to
-   differentiate them by the resulting serach index. An additional quirk: macro-expansion
-   text is also appending to this array and re-consumed in the tokch advance to expand
+   searched for matching symbols. Keywords are inserted first and thus it's easy to
+   differentiate them by the resulting search index. An additional quirk: macro-expansion
+   text is also appended to this array and re-consumed in the tokch advance to expand
    macros. Tricky tricky fun fun!
 */
 int symkey_base;
@@ -26,7 +26,7 @@ int symkey_end;
      - local-variable:      <stack-offset> <...unused...>
      - function:            <absolute-address> <backpatch-list>
      - library-symbol       <0> <...unused...>
-     - unresolved-function  <0> <backpatch-list>
+     - unresolved-function  <0> <first-entry-in-singly-linked-backpatch-list>
 */
 int symval_base;
 
@@ -34,12 +34,12 @@ int symval_base;
      - single-char tokens  <8-bit ascii code>
      - two-char operator:  <1>
      - literal numbers:    <2>   (with literal value stored in "tok_data")
-     - keywords:           <some value in [256,536]>
+     - keywords:           <int index constrained by the sym table construction described, above, i.e.: 256 <= tok <= 536>
      - idents:             <pointer to int-pair in symval_base buffer>
 */
 int tok;
 
-/* additional token data, semantics depending on context */
+/* additional token data, semantics depending on context, see other mentions */
 int tok_data;
 
 /* for each ident token: points to the ident C-string in the symtab buffer */
@@ -48,28 +48,34 @@ int ident_ptr;
 /* for each operator token: precedence level */
 int prec;
 
-/* codegen buffer where x86-32 code is emitted
-   everything in [codegen_base, codegen_ptr] is generated x86-32 code
-   (perhaps still with missing backpatching)
+/* Codegen buffer where x86-32 code is emitted.
+   All bytes in memory bounded by [codegen_base, codegen_ptr] is generated x86-32 code
+   (perhaps with various single-linked backpatch lists threaded through it in the bytes that will
+    eventually be updated to contain the resolved addresses of the respective symbols they reference).
 */
 int codegen_base;
 int codegen_ptr;
 
-/* current offset into the stackframe for the function current being compiled
-   this is reset to 0 everytime a new function decl starts */
+/* Current offset into the stackframe for the function currently being compiled.
+   This is reset to 0 whenever a new function declaration is encountered. */
 int stackframe_offset;
 
-/* global data buffer, only end pointer is retained as the base pointer is never
-   actually needed */
+/* Global data buffer.
+   Only the end pointer/cursor is maintained since the base pointer is never
+   needed beyond initialization. */
 int globdata_end;
 
-/* patch list for return statement */
+/* First address in singly-linked list for backpatching references to the ultimate
+   RET statement (return) from the function currently being compiled. */
 int return_patch_addr;
 
-/* pointer to macro expansion text currently being injected in the input char stream */
+/* Pointer to macro expansion text currently being injected in the input char stream. */
 int macro_text;
 
-/* when macro expansion is complete, this char should be emitted next */
+/* When macro expansion is complete, this char should be emitted next.
+   It was consumed as part of recognizing the macro instance and thus
+   needs to be "pushed back" into the input after expanding the body
+   of the macro. */
 int next_char_after_macro;
 
 symkey_append_char(ch)
@@ -81,11 +87,11 @@ symkey_append_char(ch)
 
 char_next()
 {
-  /* get next char for tokenizing ... possibly macro expansion text */
+  /* Get next char for tokenizing ... possibly macro expansion text */
 
   if (macro_text) { /* macro data to expand? */
     tokch = *(char*)macro_text++;
-    if (tokch == 2) { /* macro terminaor sentinel */
+    if (tokch == 2) { /* sentinel used to indicate end-of-macro-body */
       macro_text = 0; /* done! */
       tokch = next_char_after_macro;
     }
@@ -98,6 +104,7 @@ char_next()
 
 is_ident_char()
 {
+  /* Bitwise OR for simplicity and performance */ 
   return isalnum(tokch) | tokch == '_';
 }
 
@@ -124,8 +131,8 @@ tok_next()
         tok_next(); /* consume "define" */
         symkey_append_char(' ');
         *(int*)tok = 1;  /* 1 means tok is preproc define */
-        *(int*)(tok+4) = symkey_end; /* expansion str in in the symkey buffer */
-      }
+        *(int*)(tok+4) = symkey_end; /* expansion str is in the symkey buffer */
+      l
       /* NOTE: if not "define", just ignore it */
       /* consume the rest of the preproc line */
       while (tokch != '\n') {
@@ -133,7 +140,7 @@ tok_next()
         char_next();
       }
       symkey_append_char(tokch); /* append '\n' */
-      symkey_append_char(2); /* 2 is a sentinel for macro expansion */
+      symkey_append_char(2); /* 2 is a sentinel that marks end-of-macro-body; see macro expansion */
     }
     char_next(); /* consume either <space> or preproc line-term '\n' */
   }
@@ -155,6 +162,7 @@ tok_next()
       tok = 2; /* literal number */
     }
     else {
+      /* assert: !isdigit(tok) */
       /* keyword? */
       *(char*)symkey_end = ' ';
 
@@ -188,17 +196,22 @@ tok_next()
       }
     }
   }
-
   else {
+    /* assert: !is_ident_char() */
     char_next();
     if (tok == '\'') {
+      /* assert: !is_ident_char() */
+      /* assert: tok == '\''      */
       tok = 2; /* literal number */
       unescape_char();
       tok_data = tokch;
       char_next(); /* consume literal */
       char_next(); /* consume trailing ' */
     }
-    else if (tok == '/' & tokch == '*'){
+    else if (tok == '/' & tokch == '*') {
+      /* assert: !is_ident_char()          */
+      /* assert: tok != '\''               */
+      /* assert: tok == '/' & tokch == '*' */
       /* Drop comments */
       char_next();
       while (tokch) {
@@ -210,6 +223,9 @@ tok_next()
       tok_next(); /* retry! */
     }
     else {
+      /* assert: !is_ident_char()          */
+      /* assert: tok != '\''               */
+      /* assert: tok != '/' | tokch != '*' */
       /* Here we have a big amazing encoding of all operators this compiler supports. In this single encoding,
          we have:
            - 23 operators
@@ -220,11 +236,11 @@ tok_next()
              - or special-case integer data
 
          Format:
-           <operator-char1> <operator-char2> <base-64-data> <precedence byte>
+           <operator_char1> <operator_char2> <base_64_data> <precedence_byte>
 
-         For single char ops, '@' is used for operator-char2
-         Base 64 is just a mapping of [0, 63] => [34, 97] which is decoded by "- 98" and then "+ 64"
-         Finally, the precedence is given by a char >=98
+         - For single char ops, '@' is used for operator_char2.
+         - This base-64 encoding maps [0, 63] => [34, 97] which is decoded by "- 98" and then "+ 64".
+         - Finally, the precedence is given by a char >=98
 
          NOTE: This base64 range was clearly picked to be (1) contiguous and (2) in the visible char range.
          I'm surprised because it maps 0 to '"' and surprised no 0's occurred. I suspect this range was chosen
@@ -262,20 +278,33 @@ tok_next()
 
        */
 
-      /* Parse all operators
-         Suspecting that this encodes raw x86 machine code to emit for each operator...
-         Seems to be a Base-64 style encoding, all chars are visible range, or >= 32 (' ') and the "- 98" below
-         and the later "+ 64"  hints that we're using the range [32, 97] as [0, 63].
-         The calculation "z = z * 64 + C + 64" is unpacking this 6-bit encoding into a 32-bit int */
+      /* The following code performs the decoding/lookup/execution of the entries in the op_data table described above.
+         This uses a Base64-style encoding.
+         All chars in the string are in the printable range, i.e., >= 32 (' ').
+         The code makes adjustments of "- 98" and "+ 64", hinting that the range [32, 97]
+         is being used to hold values that started out in the range [0, 63].
+         The calculation "z = z * 64 + C + 64" is unpacking this 6-bit (base-64) encoding into a full-word int. */
       /* Cleverly, the terminating char is assigned to "C" and later used.. what is this? Count? */
 
 
       while (op_char1 = *(char*)op_data++){
         op_char2 = *(char*)op_data++;
         tok_data = 0;
-        while((prec = *(char*)op_data++ - 98) < 0) tok_data = tok_data * 64 + prec + 64;
+        /* Decode a full-word integer value from the 6-bit chunks encoded as base-64-style
+           printable characters in op_data. */
+        while ((prec = *(char*)op_data++ - 98) < 0) {
+           tok_data = tok_data * 64 + prec + 64;
+        }
+        /* See how '@' is used as a wildcard...
+           if op_char2=='@', then tokch doesn't need to match it. */
         if (op_char1 == tok & (op_char2 == tokch | op_char2 == '@')) {
-          if (op_char2 == tokch){
+           /* assert: op_char1 == tok */
+           /* assert: (op_char2 == tokch) | (op_char2 == '@') */
+          if (op_char2 == tokch) {
+             /* assert: op_char1 == tok */
+             /* assert: op_char2 == tokch */
+             /* We didn't use the '@' wildcard.
+               Thus it was a 2-character operator. */
             char_next();
             tok = 1; /* two-char operator */
           }
@@ -288,7 +317,19 @@ tok_next()
 
 emit(dat)
 {
-  /* Emit raw data into the codegen buf: as many bytes as are used */
+  /* Emit byte data into the codegen buffer, sourced from the signed int <dat>.
+     0-4 bytes can be emitted as follows:
+        - If the signed int is 0 (all bits are 0) or -1 (all bits are 1), then return.
+        - Otherwise, emit the least significant byte at the codegen_ptr cursor
+          and increment that cursor.
+          - Then, perform an arithmetic shift right by one byte.
+          - Recall that an arithmetic shift will shift in 1 bits if the initial value was negative
+            or 0 bits if the initial value was positive.
+          - Ultimately, after 0-4 of these shift operations, the whole int is guaranteed to be
+            filled with 1 bits or 0 bits, respectively.
+     - This technique can be used to emit any sequence of 0-4 bytes, limited by the fact that it
+       cannot emit any suffix of bytes where they are all 0 bits or all 1 bits.
+  */
 
   while (dat && dat != -1) {
     *(char*)codegen_ptr++ = dat;
@@ -298,11 +339,17 @@ emit(dat)
 
 backpatch_all(patch_addr)
 {
-  /* Fun trick: during compilation we build a linked-list of unpactched targets
-     in the codegen. When a patch is resolved, we simply walk the entire list
-     and patch each entry until NULL is reached. This allows for arbitrarily
-     deep usage of things like "break" or "return". Those just add themselves
-     to the patch list and it gets patched up with everything else!
+  /* During compilation we build a singly-linked-list of unpactched targets
+     in the generated code, using the bytes in the generated machine code
+     where the target addresses need to be placed.
+     When a forward reference is resolved (i.e., when we start generating its code,
+     and therefore know its address), we simply walk back thru the patch list, replacing
+     each entry with the address of the forward reference that has just been resolved.
+     Unsurprisingly, we stop when a NULL is reached.
+     This allows for arbitrarily deep usage of forward references to branch targets
+     for features like "else", "break", or "return".
+     Branches that make forward references add themselves to the patch list and
+     get patched up with everything else!
   */
 
   int next;
@@ -315,7 +362,11 @@ backpatch_all(patch_addr)
 
 emit_with_imm32(g,e)
 {
-  /* Emit raw data and then a 32-bit immediate: return address of immediate (for back-patching) */
+  /* Emit raw data and then a 32-bit immediate, which might be the address
+     of the next element of a singly-linked list of backpatch entries
+     embedded in the generated code.
+     Return the address where the immediate was placed, so it can become
+     the new head of the singly-linked list of backpatch entries. */
 
   emit(g);
   *(int*)codegen_ptr = e;
@@ -377,10 +428,10 @@ compile_unary(arg)
 {
   /* Compile a unary expressions and "atoms" including: string-literals, number-literals,
      cast-and-deref operations, address-of, variable loads / stores, and function calls.
-     Also, handle grouping "( EXPR )" recursions
+     Also, handle grouping "( EXPR )" recursions.
 
-     Parameter 'arg' could be named 'allow_lvalue' but the variable is abused later to
-     mean 'param_offset' for pushing call args to the stack
+     Parameter 'arg' could be named 'allow_lvalue' but it is abused later to
+     mean 'param_offset' for pushing call args to the stack.
   */
 
   int prec_save;
@@ -408,8 +459,8 @@ compile_unary(arg)
     char_next(); /* consume the trailing '"' */
     tok_next();  /* advance to next token */
   }
-
   else {
+    /* assert: tok != '"' */
     prec_save = prec;
     data_save = tok_data;
     tok_save = tok;
@@ -461,7 +512,7 @@ compile_unary(arg)
     else { /* regular symbol / variable */
       sym_addr = *(int*)tok_save;
       if (!sym_addr) sym_addr = dlsym(0, ident_ptr);
-      if (tok == '=' & arg){ /* store to var? (use 'arg' to decide if this is okay) */
+      if (tok == '=' & arg) { /* store to var? (use 'arg' to decide if this is okay) */
         tok_next();
         compile_expr();
         emit_mem_op(6, sym_addr); /* (store) */
